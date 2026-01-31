@@ -3691,16 +3691,20 @@ impl EntityInputHandler for Editor {
             return;
         }
 
-        let has_explicit_replacement_range = replacement_range_utf16.is_some();
+        // Some IME implementations commit text via `replace_text_in_range(None, ...)`, expecting
+        // the app to replace the currently marked (composing) range.
+        let effective_replacement_range_utf16 =
+            replacement_range_utf16.or_else(|| self.marked_range_utf16.clone());
+        let has_replacement_range = effective_replacement_range_utf16.is_some();
 
-        if let Some(replacement_range_utf16) = replacement_range_utf16 {
+        if let Some(replacement_range_utf16) = effective_replacement_range_utf16 {
             let byte_range = self.byte_range_for_utf16_range(replacement_range_utf16);
             self.state.selection = Selection::new(byte_range.start, byte_range.end);
         }
 
         // GPUI text input routes normal typing (including space) through this API.
         // Space should always insert a space, not trigger any structural edit.
-        if !has_explicit_replacement_range && text == " " && self.state.selection.is_collapsed() {
+        if !has_replacement_range && text == " " && self.state.selection.is_collapsed() {
             self.insert_text(" ");
         } else {
             self.insert_text(text);
