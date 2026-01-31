@@ -12,13 +12,17 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 
+use ropey::Rope;
+
 /// Counter for generating unique editor instance IDs.
 static NEXT_EDITOR_ID: AtomicUsize = AtomicUsize::new(0);
 
 use gpui::{
-    AnyElement, App, Context, Corner, CursorStyle, DragMoveEvent, Empty, FocusHandle, Focusable,
-    Hsla, IntoElement, KeyDownEvent, ListAlignment, ListState, ModifiersChangedEvent, MouseButton,
-    ReadGlobal, Render, Rgba, TextRun, Window, anchored, div, font, list, point, prelude::*, px,
+    AnyElement, App, Bounds, Context, Corner, CursorStyle, DragMoveEvent, ElementInputHandler,
+    Empty, EntityInputHandler, FocusHandle, Focusable, Hsla, IntoElement, KeyDownEvent,
+    ListAlignment, ListState, ModifiersChangedEvent, MouseButton, Pixels, ReadGlobal, Render,
+    Rgba, TextRun, UTF16Selection, Window, anchored, canvas, div, font, list, point, prelude::*,
+    px,
 };
 
 /// Marker type for text selection drag operations.
@@ -1701,6 +1705,9 @@ pub struct Editor {
     /// Line ranges that are user messages (for chat editor background highlighting).
     /// Each range is start_line..end_line (exclusive).
     user_message_lines: Vec<Range<usize>>,
+
+    /// Current IME composing (marked) range in UTF-16 code units.
+    marked_range_utf16: Option<Range<usize>>,
 }
 
 impl Editor {
@@ -1751,7 +1758,49 @@ impl Editor {
             diff_state: None,
             pending_agent_write: false,
             user_message_lines: Vec::new(),
+            marked_range_utf16: None,
         }
+    }
+
+    /// Convert a byte offset (UTF-8) into a UTF-16 code unit offset.
+    fn utf16_offset_for_byte_offset(&self, byte_offset: usize) -> usize {
+        let rope: &Rope = self.state.buffer.rope();
+        let byte_offset = byte_offset.min(rope.len_bytes());
+        let char_end = rope.byte_to_char(byte_offset);
+        rope.slice(..char_end).chars().map(|c| c.len_utf16()).sum()
+    }
+
+    /// Convert a UTF-16 code unit offset into a byte offset (UTF-8).
+    fn byte_offset_for_utf16_offset(&self, utf16_offset: usize) -> usize {
+        let rope: &Rope = self.state.buffer.rope();
+        let mut remaining = utf16_offset;
+        let mut char_idx = 0usize;
+
+        for c in rope.chars() {
+            let units = c.len_utf16();
+            if remaining < units {
+                break;
+            }
+            remaining -= units;
+            char_idx += 1;
+            if remaining == 0 {
+                break;
+            }
+        }
+
+        rope.char_to_byte(char_idx)
+    }
+
+    fn utf16_range_for_byte_range(&self, range: Range<usize>) -> Range<usize> {
+        let rope: &Rope = self.state.buffer.rope();
+        let len = rope.len_bytes();
+        let start = range.start.min(len);
+        let end = range.end.min(len);
+        self.utf16_offset_for_byte_offset(start)..self.utf16_offset_for_byte_offset(end)
+    }
+
+    fn byte_range_for_utf16_range(&self, range: Range<usize>) -> Range<usize> {
+        self.byte_offset_for_utf16_offset(range.start)..self.byte_offset_for_utf16_offset(range.end)
     }
 
     /// Set whether this editor is the primary editor that updates global state.
@@ -3334,27 +3383,7 @@ impl Editor {
                 self.refresh_github_refs(cx);
             }
 
-            _ => {
-                if let Some(key_char) = &keystroke.key_char {
-                    if key_char == " " {
-                        if !self.state.try_insert_space() {
-                            return;
-                        }
-                    } else {
-                        self.insert_text(key_char);
-                    }
-
-                    if key_char == ">" {
-                        self.state.maybe_complete_blockquote_marker();
-                    }
-
-                    if key_char == "`" || key_char == "~" {
-                        self.state.maybe_complete_code_fence();
-                    }
-
-                    self.scroll_to_cursor_pending = true;
-                }
-            }
+            _ => {}
         }
 
         cx.notify();
@@ -3599,6 +3628,157 @@ impl Editor {
 impl Focusable for Editor {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+impl EntityInputHandler for Editor {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let byte_range = self.byte_range_for_utf16_range(range_utf16.clone());
+        let actual_utf16 = self.utf16_range_for_byte_range(byte_range.clone());
+        if actual_utf16 != range_utf16 {
+            *adjusted_range = Some(actual_utf16);
+        }
+        Some(self.state.buffer.slice_cow(byte_range).to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        if ignore_disabled_input && self.input_blocked {
+            return None;
+        }
+
+        let selection = self.state.selection;
+        let start = selection.anchor.min(selection.head);
+        let end = selection.anchor.max(selection.head);
+        let range = self.utf16_range_for_byte_range(start..end);
+
+        Some(UTF16Selection {
+            range,
+            reversed: selection.anchor > selection.head,
+        })
+    }
+
+    fn marked_text_range(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Range<usize>> {
+        self.marked_range_utf16.clone()
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.marked_range_utf16.is_some() {
+            self.marked_range_utf16 = None;
+            cx.notify();
+        }
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        replacement_range_utf16: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.input_blocked {
+            return;
+        }
+
+        let has_explicit_replacement_range = replacement_range_utf16.is_some();
+
+        if let Some(replacement_range_utf16) = replacement_range_utf16 {
+            let byte_range = self.byte_range_for_utf16_range(replacement_range_utf16);
+            self.state.selection = Selection::new(byte_range.start, byte_range.end);
+        }
+
+        if !has_explicit_replacement_range && text == " " && self.state.selection.is_collapsed() {
+            if !self.state.try_insert_space() {
+                return;
+            }
+        } else {
+            self.insert_text(text);
+
+            if text == ">" {
+                self.state.maybe_complete_blockquote_marker();
+            }
+            if text == "`" || text == "~" {
+                self.state.maybe_complete_code_fence();
+            }
+        }
+
+        self.marked_range_utf16 = None;
+        self.request_scroll_to_cursor();
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range_utf16: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.input_blocked {
+            return;
+        }
+
+        let replacement_range_utf16 = range_utf16.or_else(|| self.marked_range_utf16.clone());
+        if let Some(replacement_range_utf16) = replacement_range_utf16 {
+            let byte_range = self.byte_range_for_utf16_range(replacement_range_utf16);
+            self.state.selection = Selection::new(byte_range.start, byte_range.end);
+        }
+
+        let insert_start = self.state.selection.range().start;
+        self.insert_text(new_text);
+        let insert_end = insert_start + new_text.len();
+
+        self.marked_range_utf16 = Some(self.utf16_range_for_byte_range(insert_start..insert_end));
+
+        if let Some(new_selected_range_utf16) = new_selected_range_utf16 {
+            let byte_range = self.byte_range_for_utf16_range(new_selected_range_utf16);
+            self.state.selection = Selection::new(byte_range.start, byte_range.end);
+        }
+
+        self.request_scroll_to_cursor();
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let cursor_screen_pos = CursorScreenPosition::global(cx);
+        let pos = cursor_screen_pos
+            .position
+            .unwrap_or_else(|| point(element_bounds.origin.x, element_bounds.origin.y));
+
+        let line_height = self.config.line_height.to_pixels(window.rem_size());
+        Some(Bounds::new(
+            pos,
+            gpui::Size {
+                width: px(1.0),
+                height: line_height,
+            },
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(self.utf16_offset_for_byte_offset(self.state.selection.head))
     }
 }
 
@@ -4010,6 +4190,25 @@ impl Render for Editor {
             .size_full(),
         );
 
+        // Wire GPUI's text input / IME system to this editor.
+        // Must be assigned during paint (see Window::handle_input).
+        let input_handler_canvas = {
+            let view = cx.entity();
+            let focus_handle = self.focus_handle.clone();
+            canvas(
+                |_bounds, _window, _cx| (),
+                move |bounds, (), window: &mut Window, cx| {
+                    window.handle_input(
+                        &focus_handle,
+                        ElementInputHandler::new(bounds, view.clone()),
+                        cx,
+                    );
+                },
+            )
+            .absolute()
+            .size_full()
+        };
+
         div()
             .id(("editor", editor_id))
             .track_focus(&self.focus_handle)
@@ -4168,6 +4367,7 @@ impl Render for Editor {
                     CursorStyle::IBeam
                 },
             )
+            .child(input_handler_canvas)
             .child(line_list)
             .children(self.render_autocomplete(&line_theme, window, cx))
             .children(self.render_github_ref_hover(&line_theme, window, cx))
