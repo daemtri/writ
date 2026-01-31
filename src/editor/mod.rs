@@ -3698,10 +3698,10 @@ impl EntityInputHandler for Editor {
             self.state.selection = Selection::new(byte_range.start, byte_range.end);
         }
 
+        // GPUI text input routes normal typing (including space) through this API.
+        // Space should always insert a space, not trigger any structural edit.
         if !has_explicit_replacement_range && text == " " && self.state.selection.is_collapsed() {
-            if !self.state.try_insert_space() {
-                return;
-            }
+            self.insert_text(" ");
         } else {
             self.insert_text(text);
 
@@ -3743,7 +3743,23 @@ impl EntityInputHandler for Editor {
         self.marked_range_utf16 = Some(self.utf16_range_for_byte_range(insert_start..insert_end));
 
         if let Some(new_selected_range_utf16) = new_selected_range_utf16 {
-            let byte_range = self.byte_range_for_utf16_range(new_selected_range_utf16);
+            // GPUI/IME APIs report the selected range within the newly inserted marked text
+            // (i.e., relative to `new_text`), not absolute document offsets.
+            // Some platforms may report absolute offsets, so detect and handle both.
+            let marked_range_utf16 = self.marked_range_utf16.clone();
+            let absolute_selected_range_utf16 = if let Some(marked_range_utf16) = marked_range_utf16 {
+                let marked_len = marked_range_utf16.end.saturating_sub(marked_range_utf16.start);
+                if new_selected_range_utf16.end <= marked_len {
+                    (marked_range_utf16.start + new_selected_range_utf16.start)
+                        ..(marked_range_utf16.start + new_selected_range_utf16.end)
+                } else {
+                    new_selected_range_utf16
+                }
+            } else {
+                new_selected_range_utf16
+            };
+
+            let byte_range = self.byte_range_for_utf16_range(absolute_selected_range_utf16);
             self.state.selection = Selection::new(byte_range.start, byte_range.end);
         }
 
