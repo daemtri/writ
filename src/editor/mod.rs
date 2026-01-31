@@ -1268,7 +1268,8 @@ impl EditorState {
             return;
         }
 
-        let new_pos = cursor_pos - 1;
+        // Delete one cursor unit (UTF-8 safe).
+        let new_pos = self.cursor().move_left(&self.buffer).offset;
         self.buffer.delete(new_pos..cursor_pos, cursor_pos);
         self.selection = Selection::new(new_pos, new_pos);
         self.propagate_checkbox_after_edit();
@@ -4377,6 +4378,18 @@ impl Render for Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backspace_deletes_one_utf8_char() {
+        let mut state = EditorState::new("你好");
+        let end = state.buffer.len_bytes();
+        state.selection = Selection::new(end, end);
+
+        state.delete_backward();
+
+        assert_eq!(state.text(), "你");
+        assert_eq!(state.cursor().offset, state.buffer.len_bytes());
+    }
 
     /// Trim leading newline from raw string literals for readability.
     /// Allows writing:

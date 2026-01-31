@@ -283,6 +283,15 @@ impl MarkdownParser {
     ) -> Option<MarkdownTree> {
         self.parse_with(
             &mut |byte, _| {
+                // tree-sitter may request data at or past EOF. Ropey panics if
+                // chunk_at_byte is called with an out-of-bounds index, and that
+                // panic cannot unwind through the FFI boundary.
+                let len = rope.len_bytes();
+                if byte >= len {
+                    let empty: &[u8] = &[];
+                    return empty;
+                }
+
                 let (chunk, chunk_start, _, _) = rope.chunk_at_byte(byte);
                 &chunk.as_bytes()[byte - chunk_start..]
             },
@@ -293,6 +302,7 @@ impl MarkdownParser {
 
 #[cfg(test)]
 mod tests {
+    use ropey::Rope;
     use tree_sitter::{InputEdit, Point};
 
     use super::*;
@@ -373,6 +383,27 @@ mod tests {
         assert!(cursor.goto_parent());
         assert!(cursor.goto_parent());
         assert_eq!(cursor.node().kind(), "document");
+    }
+
+    #[test]
+    fn parse_rope_does_not_panic_on_out_of_bounds_requests() {
+        // If an incremental edit is misapplied, tree-sitter may request input at
+        // an out-of-bounds byte offset. Our rope-backed callback must never panic
+        // (panics cannot unwind across the FFI boundary).
+        let rope = Rope::from_str("a");
+        let mut parser = MarkdownParser::default();
+
+        let mut tree = parser.parse_rope(&rope, None).unwrap();
+        tree.edit(&InputEdit {
+            start_byte: 0,
+            old_end_byte: 0,
+            new_end_byte: 3,
+            start_position: Point { row: 0, column: 0 },
+            old_end_position: Point { row: 0, column: 0 },
+            new_end_position: Point { row: 0, column: 3 },
+        });
+
+        assert!(parser.parse_rope(&rope, Some(&tree)).is_some());
     }
 
     #[test]
