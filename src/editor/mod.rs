@@ -1709,6 +1709,18 @@ pub struct Editor {
 
     /// Current IME composing (marked) range in UTF-16 code units.
     marked_range_utf16: Option<Range<usize>>,
+
+    /// Cached focus state updated during render.
+    is_focused: bool,
+
+    /// Whether the caret is currently visible (for blinking).
+    cursor_visible: bool,
+
+    /// Task that toggles cursor_visible while focused.
+    cursor_blink_task: Option<gpui::Task<()>>,
+
+    /// Monotonically increasing value used to stop old blink loops.
+    cursor_blink_epoch: u64,
 }
 
 impl Editor {
@@ -1760,7 +1772,93 @@ impl Editor {
             pending_agent_write: false,
             user_message_lines: Vec::new(),
             marked_range_utf16: None,
+
+            is_focused: false,
+
+            cursor_visible: true,
+            cursor_blink_task: None,
+
+            cursor_blink_epoch: 0,
         }
+    }
+
+    fn reset_cursor_blink(&mut self, cx: &mut Context<Self>) {
+        // Always show immediately on interaction
+        self.cursor_visible = true;
+
+        // Stop any existing blink loop; a new one may be started below.
+        self.cursor_blink_epoch = self.cursor_blink_epoch.wrapping_add(1);
+        self.cursor_blink_task = None;
+
+        // Restart blink loop if we're focused
+        if self.is_focused {
+            self.start_cursor_blink(cx);
+        }
+
+        cx.notify();
+    }
+
+    fn start_cursor_blink(&mut self, cx: &mut Context<Self>) {
+        // Cancel any prior loop
+        self.cursor_blink_task = None;
+
+        // Bump epoch so any previously spawned loop will exit.
+        self.cursor_blink_epoch = self.cursor_blink_epoch.wrapping_add(1);
+        let blink_epoch = self.cursor_blink_epoch;
+
+        let task = cx.spawn(async move |weak, cx| {
+            // Standard-ish blink cadence
+            let interval = std::time::Duration::from_millis(530);
+            loop {
+                cx.background_executor().timer(interval).await;
+
+                let continue_loop = cx
+                    .update(|cx| {
+                        let Some(editor) = weak.upgrade() else {
+                            return false;
+                        };
+
+                        editor.update(cx, |editor, cx| {
+                            // If a new blink loop started, exit this one.
+                            if editor.cursor_blink_epoch != blink_epoch {
+                                return false;
+                            }
+
+                            // Stop blinking if not focused / can't accept input.
+                            if !editor.is_focused || editor.input_blocked {
+                                editor.cursor_visible = true;
+                                cx.notify();
+                                return false;
+                            }
+
+                            // During IME composition, keep caret solid/visible.
+                            if editor.marked_range_utf16.is_some() {
+                                editor.cursor_visible = true;
+                                cx.notify();
+                                return true;
+                            }
+
+                            // While selecting, keep caret hidden (selection highlight is shown).
+                            if !editor.state.selection.is_collapsed() {
+                                editor.cursor_visible = false;
+                                cx.notify();
+                                return true;
+                            }
+
+                            editor.cursor_visible = !editor.cursor_visible;
+                            cx.notify();
+                            true
+                        })
+                    })
+                    .unwrap_or(false);
+
+                if !continue_loop {
+                    break;
+                }
+            }
+        });
+
+        self.cursor_blink_task = Some(task);
     }
 
     /// Convert a byte offset (UTF-8) into a UTF-16 code unit offset.
@@ -2854,6 +2952,7 @@ impl Editor {
                             None,       // no line background
                             Vec::new(), // no inline highlight ranges
                             None,       // no inline highlight color
+                            false,      // no cursor paint in popup
                         )
                         .with_prefix(prefix_text, prefix_runs)
                         .truncate(px(484.0))
@@ -3059,6 +3158,7 @@ impl Editor {
                     None,       // no line background
                     Vec::new(), // no inline highlight ranges
                     None,       // no inline highlight color
+                    false,      // no cursor paint in popup
                 )
                 .with_prefix(prefix_text, prefix_runs)
                 .truncate(px(484.0))
@@ -3560,27 +3660,43 @@ impl Editor {
         match action {
             EditorAction::Type(c) => {
                 self.insert_text(&c.to_string());
+                self.reset_cursor_blink(cx);
+                return;
             }
             EditorAction::Enter => {
                 self.enter();
+                self.reset_cursor_blink(cx);
+                return;
             }
             EditorAction::ShiftEnter => {
                 self.shift_enter();
+                self.reset_cursor_blink(cx);
+                return;
             }
             EditorAction::ShiftAltEnter => {
                 self.shift_alt_enter();
+                self.reset_cursor_blink(cx);
+                return;
             }
             EditorAction::Tab => {
                 self.tab();
+                self.reset_cursor_blink(cx);
+                return;
             }
             EditorAction::ShiftTab => {
                 self.shift_tab();
+                self.reset_cursor_blink(cx);
+                return;
             }
             EditorAction::Backspace => {
                 self.delete_backward();
+                self.reset_cursor_blink(cx);
+                return;
             }
             EditorAction::Move(direction) => {
                 self.move_in_direction(direction.clone(), false);
+                self.reset_cursor_blink(cx);
+                return;
             }
             EditorAction::Click {
                 offset,
@@ -3588,12 +3704,16 @@ impl Editor {
                 click_count,
             } => {
                 self.state.handle_click(*offset, *shift, *click_count);
+                self.reset_cursor_blink(cx);
+                return;
             }
             EditorAction::Drag { offset } => {
                 if !self.in_drag_scroll_zone {
                     self.state.handle_drag(*offset);
                     self.is_selecting = true;
                 }
+                self.reset_cursor_blink(cx);
+                return;
             }
             EditorAction::ToggleCheckbox { line_number } => {
                 self.toggle_checkbox(*line_number, cx);
@@ -3622,7 +3742,6 @@ impl Editor {
                 return; // Opening a link doesn't change editor state
             }
         }
-        cx.notify();
     }
 }
 
@@ -3805,6 +3924,9 @@ impl EntityInputHandler for Editor {
 
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Track focus state for cursor blinking logic.
+        self.is_focused = self.focus_handle.is_focused(window);
+
         let buffer_version = self.state.buffer.version();
         if buffer_version != self.last_synced_version {
             self.last_synced_version = buffer_version;
@@ -3944,8 +4066,7 @@ impl Render for Editor {
         };
 
         // Only show cursor and selection when this editor is focused and input is not blocked
-        let is_focused = self.focus_handle.is_focused(window);
-        let show_cursor = is_focused && !self.input_blocked;
+        let show_cursor = self.is_focused && !self.input_blocked;
         let cursor_offset = self.state.selection.head;
         let selection_range = if show_cursor && !self.state.selection.is_collapsed() {
             Some(self.state.selection.range())
@@ -3958,6 +4079,25 @@ impl Render for Editor {
         } else {
             usize::MAX
         };
+
+        // Values captured by list item closures (must not capture &mut self).
+        let cursor_visible_for_lines = self.cursor_visible;
+        let show_cursor_for_lines = show_cursor;
+
+        // Manage cursor blink lifecycle.
+        if show_cursor {
+            if self.cursor_blink_task.is_none() {
+                self.start_cursor_blink(cx);
+            }
+        } else {
+            // Ensure caret is visible next time we focus.
+            self.cursor_visible = true;
+
+            // Ensure any existing blink loop exits.
+            self.cursor_blink_epoch = self.cursor_blink_epoch.wrapping_add(1);
+
+            self.cursor_blink_task = None;
+        }
 
         let base_path = self.config.base_path.clone();
 
@@ -4033,9 +4173,9 @@ impl Render for Editor {
                                   github_ref_ranges: Vec<Range<usize>>,
                                   hovered_ref_range: Option<Range<usize>>,
                                   line_background: Option<Rgba>,
-                                  inline_highlight_ranges: Vec<Range<usize>>,
-                                  inline_highlight_color: Option<Rgba>,
-                                  block_input: bool|
+                                   inline_highlight_ranges: Vec<Range<usize>>,
+                                   inline_highlight_color: Option<Rgba>,
+                                   block_input: bool|
                  -> Line {
                     let line_markers = snap.line_markers(line_idx);
                     let mut inline_styles = snap.inline_styles_for_line(line_idx);
@@ -4077,6 +4217,9 @@ impl Render for Editor {
                         line_background,
                         inline_highlight_ranges,
                         inline_highlight_color,
+                        // Keep cursor position tracking always-on when focused (used for popups),
+                        // but only paint the caret when blinking state allows.
+                        show_cursor_for_lines && cursor_visible_for_lines,
                     )
                 };
 

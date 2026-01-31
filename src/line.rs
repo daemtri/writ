@@ -202,6 +202,9 @@ pub struct Line {
     inline_highlight_ranges: Vec<Range<usize>>,
     /// Color for inline highlight ranges.
     inline_highlight_color: Option<Rgba>,
+
+    /// Whether the caret should be painted (cursor position still tracked).
+    cursor_visible: bool,
 }
 
 impl Line {
@@ -222,6 +225,7 @@ impl Line {
         line_background: Option<Rgba>,
         inline_highlight_ranges: Vec<Range<usize>>,
         inline_highlight_color: Option<Rgba>,
+        cursor_visible: bool,
     ) -> Self {
         let substitution = {
             let s = line.substitution_rope(&rope);
@@ -246,6 +250,7 @@ impl Line {
             line_background,
             inline_highlight_ranges,
             inline_highlight_color,
+            cursor_visible,
         }
     }
 
@@ -1043,7 +1048,12 @@ impl Line {
         }
     }
 
-    fn render_cursor(&self, cursor_pos: usize, text_layout: gpui::TextLayout) -> impl IntoElement {
+    fn render_cursor(
+        &self,
+        cursor_pos: usize,
+        text_layout: gpui::TextLayout,
+        visible: bool,
+    ) -> impl IntoElement {
         let cursor_color = self.theme.cursor_color;
 
         canvas(
@@ -1082,6 +1092,10 @@ impl Line {
                     position: Some(pos),
                     content_right_edge: Some(bounds.origin.x + bounds.size.width),
                 });
+
+                if !visible {
+                    return;
+                }
 
                 let text_style = window.text_style();
                 let font_size = text_style.font_size.to_pixels(window.rem_size());
@@ -1138,7 +1152,7 @@ impl Line {
         .size_full()
     }
 
-    fn render_spacer_cursor(&self, char_offset: usize) -> impl IntoElement {
+    fn render_spacer_cursor(&self, char_offset: usize, visible: bool) -> impl IntoElement {
         let cursor_color = self.theme.cursor_color;
         let cursor_font = self.theme.text_font.clone();
         let char_width = self.theme.monospace_char_width;
@@ -1147,6 +1161,9 @@ impl Line {
         canvas(
             move |_bounds, _window, _cx| (),
             move |bounds, _, window: &mut Window, cx| {
+                if !visible {
+                    return;
+                }
                 let text_style = window.text_style();
                 let font_size = text_style.font_size.to_pixels(window.rem_size());
                 let line_height = text_style
@@ -1361,7 +1378,9 @@ impl RenderOnce for Line {
                         spacer = spacer.bg(self.theme.selection_color);
                     }
                     if cursor_in_this_marker {
-                        spacer = spacer.child(self.render_spacer_cursor(cursor_char_offset));
+                        spacer = spacer.child(
+                            self.render_spacer_cursor(cursor_char_offset, self.cursor_visible),
+                        );
                     }
                     let marker_start = marker.range.start;
                     spacer = spacer.on_mouse_down(
@@ -1463,7 +1482,9 @@ impl RenderOnce for Line {
                         spacer = spacer.bg(self.theme.selection_color);
                     }
                     if cursor_in_this_marker {
-                        spacer = spacer.child(self.render_spacer_cursor(cursor_char_offset));
+                        spacer = spacer.child(
+                            self.render_spacer_cursor(cursor_char_offset, self.cursor_visible),
+                        );
                     }
                     let marker_start = marker.range.start;
                     spacer = spacer.on_mouse_down(
@@ -1527,7 +1548,9 @@ impl RenderOnce for Line {
                     }
                     if cursor_in_this_marker {
                         marker_label =
-                            marker_label.child(self.render_spacer_cursor(cursor_char_offset));
+                            marker_label.child(
+                                self.render_spacer_cursor(cursor_char_offset, self.cursor_visible),
+                            );
                     }
 
                     let marker_start = marker.range.start;
@@ -1578,7 +1601,11 @@ impl RenderOnce for Line {
 
         if let Some(cursor_pos) = visual_cursor_pos {
             text_container =
-                text_container.child(self.render_cursor(cursor_pos, text_layout.clone()));
+                text_container.child(self.render_cursor(
+                    cursor_pos,
+                    text_layout.clone(),
+                    self.cursor_visible,
+                ));
         }
 
         let content_range_for_handlers = if self.line.is_fence() {
