@@ -9,6 +9,7 @@ pub use theme::EditorTheme;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 
@@ -17,12 +18,23 @@ use ropey::Rope;
 /// Counter for generating unique editor instance IDs.
 static NEXT_EDITOR_ID: AtomicUsize = AtomicUsize::new(0);
 
+// Key context name for editor-scoped keybindings.
+// Binding Tab/Shift-Tab in this context lets the editor override Root/window Tab traversal
+// in embedding applications.
+const EDITOR_KEY_CONTEXT: &str = "Editor";
+
+// Ensure we only bind editor keybindings once per process.
+static EDITOR_KEYBINDINGS_BOUND: OnceLock<()> = OnceLock::new();
+
 use gpui::{
     AnyElement, App, Bounds, Context, Corner, CursorStyle, DragMoveEvent, ElementInputHandler,
     Empty, EntityInputHandler, FocusHandle, Focusable, Hsla, IntoElement, KeyDownEvent,
-    ListAlignment, ListState, ModifiersChangedEvent, MouseButton, Pixels, ReadGlobal, Render, Rgba,
-    TextRun, UTF16Selection, Window, anchored, canvas, div, font, list, point, prelude::*, px,
+    KeyBinding, ListAlignment, ListState, ModifiersChangedEvent, MouseButton, Pixels, ReadGlobal,
+    Render, Rgba, TextRun, UTF16Selection, Window, actions, anchored, canvas, div, font, list,
+    point, prelude::*, px,
 };
+
+actions!(editor, [EditorTab, EditorShiftTab]);
 
 /// Marker type for text selection drag operations.
 /// Used with GPUI's on_drag/on_drag_move to receive mouse events outside element bounds.
@@ -1713,6 +1725,9 @@ pub struct Editor {
     /// Cached focus state updated during render.
     is_focused: bool,
 
+    /// Guard to avoid double-handling Tab when a keybinding action fired first.
+    tab_handled_via_action: bool,
+
     /// Whether the caret is currently visible (for blinking).
     cursor_visible: bool,
 
@@ -1731,6 +1746,14 @@ impl Editor {
 
     /// Create a new editor with the given content and configuration.
     pub fn with_config(content: &str, config: EditorConfig, cx: &mut Context<Self>) -> Self {
+        // Self-register editor-scoped keybindings so embedded apps don't need extra setup.
+        EDITOR_KEYBINDINGS_BOUND.get_or_init(|| {
+            cx.bind_keys([
+                KeyBinding::new("tab", EditorTab, Some(EDITOR_KEY_CONTEXT)),
+                KeyBinding::new("shift-tab", EditorShiftTab, Some(EDITOR_KEY_CONTEXT)),
+            ]);
+        });
+
         let focus_handle = cx.focus_handle();
         let state = EditorState::new(content);
         let line_count = state.buffer.line_count();
@@ -1774,6 +1797,8 @@ impl Editor {
             marked_range_utf16: None,
 
             is_focused: false,
+
+            tab_handled_via_action: false,
 
             cursor_visible: true,
             cursor_blink_task: None,
@@ -3387,12 +3412,18 @@ impl Editor {
         self.scroll_to_cursor_pending = true;
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.input_blocked {
             return;
         }
 
         let keystroke = &event.keystroke;
+
+        // If Tab was already handled via keymap action dispatch, don't handle it again here.
+        if keystroke.key.as_str() == "tab" && self.tab_handled_via_action {
+            self.tab_handled_via_action = false;
+            return;
+        }
 
         // Handle autocomplete keyboard navigation
         if self.autocomplete.is_some() {
@@ -3430,6 +3461,11 @@ impl Editor {
                         && !ac.suggestions.is_empty()
                         && self.accept_autocomplete_suggestion()
                     {
+                        // When accepting via Tab, ensure we don't trigger window-level tab traversal.
+                        if keystroke.key.as_str() == "tab" {
+                            cx.stop_propagation();
+                            window.prevent_default();
+                        }
                         cx.notify();
                         return;
                     }
@@ -3507,6 +3543,10 @@ impl Editor {
                 }
             }
             "tab" => {
+                // Best-effort: stop propagation for hosts that don't use keymap actions.
+                cx.stop_propagation();
+                window.prevent_default();
+
                 if self.state.cursor_in_code_block() {
                     self.insert_text("    ");
                 } else if keystroke.modifiers.shift {
@@ -4472,7 +4512,49 @@ impl Render for Editor {
         div()
             .id(("editor", editor_id))
             .track_focus(&self.focus_handle)
-            .key_context("Editor")
+            .key_context(EDITOR_KEY_CONTEXT)
+            .on_action(cx.listener(|editor: &mut Editor, _: &EditorTab, window, cx| {
+                if editor.input_blocked {
+                    return;
+                }
+
+                editor.tab_handled_via_action = true;
+                cx.stop_propagation();
+                window.prevent_default();
+
+                // Autocomplete accept takes precedence when visible.
+                let can_accept = editor
+                    .autocomplete
+                    .as_ref()
+                    .is_some_and(|ac| !ac.suggestions.is_empty());
+                if can_accept && editor.accept_autocomplete_suggestion() {
+                    editor.reset_cursor_blink(cx);
+                    return;
+                }
+
+                if editor.state.cursor_in_code_block() {
+                    editor.insert_text("    ");
+                } else {
+                    editor.tab();
+                }
+                editor.reset_cursor_blink(cx);
+            }))
+            .on_action(cx.listener(|editor: &mut Editor, _: &EditorShiftTab, window, cx| {
+                if editor.input_blocked {
+                    return;
+                }
+
+                editor.tab_handled_via_action = true;
+                cx.stop_propagation();
+                window.prevent_default();
+
+                if editor.state.cursor_in_code_block() {
+                    editor.insert_text("    ");
+                } else {
+                    editor.shift_tab();
+                }
+                editor.reset_cursor_blink(cx);
+            }))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .on_action(cx.listener(
