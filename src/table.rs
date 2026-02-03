@@ -120,8 +120,12 @@ pub fn detect_pipe_tables(lines: &[(usize, Range<usize>, String)]) -> Vec<TableR
             replacements.push((row.line_idx, row.line_range.clone(), rendered));
         }
 
-        // Delimiter row: render as empty (keep line height stable by using a single space).
-        replacements.push((delim_line_idx, delim_line_range, " ".to_string()));
+        // Delimiter row: render as a divider line.
+        replacements.push((
+            delim_line_idx,
+            delim_line_range,
+            format_divider_line(&block.widths),
+        ));
 
         out.push(TableRender {
             block,
@@ -133,6 +137,14 @@ pub fn detect_pipe_tables(lines: &[(usize, Range<usize>, String)]) -> Vec<TableR
     }
 
     out
+}
+
+fn format_divider_line(widths: &[usize]) -> String {
+    // Match the visual width of `format_row` (sum of column widths plus the 2-space gaps).
+    let cols = widths.len();
+    let total_width = widths.iter().sum::<usize>() + 2 * cols.saturating_sub(1);
+    let total_width = total_width.max(1);
+    "─".repeat(total_width)
 }
 
 fn is_pipe_table_row_candidate(s: &str) -> bool {
@@ -383,7 +395,7 @@ mod tests {
 
         // Delimiter replacement
         let delim = t.replacements.iter().find(|(ix, _, _)| *ix == 1).unwrap();
-        assert_eq!(delim.2, " ");
+        assert_eq!(delim.2, "───────");
     }
 
     #[test]
