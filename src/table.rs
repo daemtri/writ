@@ -6,6 +6,8 @@
 
 use std::ops::Range;
 
+use unicode_width::UnicodeWidthStr;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnAlign {
     Left,
@@ -266,8 +268,9 @@ fn normalize_cells(mut cells: Vec<String>, columns: usize) -> Vec<String> {
 }
 
 fn visible_width(s: &str) -> usize {
-    // v1: count Unicode scalar values (chars), after trimming.
-    s.trim().chars().count()
+    // Count terminal display width (monospace cell width) after trimming.
+    // This aligns CJK and other wide characters correctly.
+    UnicodeWidthStr::width(s.trim())
 }
 
 fn compute_widths(rows: &[ParsedRow], columns: usize) -> Vec<usize> {
@@ -282,7 +285,7 @@ fn compute_widths(rows: &[ParsedRow], columns: usize) -> Vec<usize> {
 
 fn pad_to_width(s: &str, width: usize, align: ColumnAlign) -> String {
     let t = s.trim();
-    let len = t.chars().count();
+    let len = UnicodeWidthStr::width(t);
     if len >= width {
         return t.to_string();
     }
@@ -299,8 +302,11 @@ fn pad_to_width(s: &str, width: usize, align: ColumnAlign) -> String {
 }
 
 fn format_row(cells: &[String], widths: &[usize], align: &[ColumnAlign]) -> String {
+    // Render as aligned columns without visible table borders.
+    // Use 2 spaces between columns for readability.
+    let cols = cells.len().min(widths.len()).min(align.len());
     let mut out = String::new();
-    for i in 0..cells.len().min(widths.len()).min(align.len()) {
+    for i in 0..cols {
         if i > 0 {
             out.push_str("  ");
         }
@@ -312,6 +318,46 @@ fn format_row(cells: &[String], widths: &[usize], align: &[ColumnAlign]) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_width_cells_align_across_rows() {
+        let lines = vec![
+            (0usize, 0..27, "| 姓名 | 年龄 | 城市 |".to_string()),
+            (1usize, 28..49, "| :--- | :--: | ---: |".to_string()),
+            (2usize, 50..70, "| 张三 | 25   | 北京 |".to_string()),
+            (3usize, 71..92, "| 李四 | 30   | 上海 |".to_string()),
+        ];
+        let tables = detect_pipe_tables(&lines);
+        assert_eq!(tables.len(), 1);
+        let t = &tables[0];
+
+        let header = t.replacements.iter().find(|(ix, _, _)| *ix == 0).unwrap();
+        let body1 = t.replacements.iter().find(|(ix, _, _)| *ix == 2).unwrap();
+        let body2 = t.replacements.iter().find(|(ix, _, _)| *ix == 3).unwrap();
+
+        // Verify widths are computed by display width, not byte/chars count.
+        // Using Unicode display width, CJK chars count as 2 columns.
+        assert_eq!(t.block.widths.len(), 3);
+        assert_eq!(t.block.widths[0], 4); // max("姓名", "张三", "李四") => 2 CJK chars => width 4
+        assert_eq!(t.block.widths[1], 4); // "年龄" => width 4
+        assert_eq!(t.block.widths[2], 4); // "城市" => width 4
+
+        // And the rendered strings should have identical *display widths* per row.
+        // (Byte lengths differ because CJK chars are multi-byte UTF-8.)
+        use unicode_width::UnicodeWidthStr;
+
+        assert_eq!(
+            UnicodeWidthStr::width(header.2.as_str()),
+            UnicodeWidthStr::width(body1.2.as_str())
+        );
+        assert_eq!(
+            UnicodeWidthStr::width(header.2.as_str()),
+            UnicodeWidthStr::width(body2.2.as_str())
+        );
+
+        // No visible table borders in collapsed rendering.
+        assert!(!header.2.contains('|'));
+    }
 
     #[test]
     fn detects_simple_table_and_formats_rows() {

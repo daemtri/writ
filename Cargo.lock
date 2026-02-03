@@ -7910,6 +7910,7 @@ dependencies = [
  "tree-sitter-md",
  "tree-sitter-rust",
  "undo",
+ "unicode-width",
 ]
 
 [[package]]
