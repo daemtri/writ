@@ -216,3 +216,11 @@ When typing `# Hello`, tree-sitter doesn't recognize it as a heading until enoug
 ### Ordered List Continuation Shows Wrong Number
 
 Pressing Shift+Enter on an ordered list item inserts `1. ` as a placeholder. The correct number appears after you start typing, when tree-sitter recognizes the list structure and auto-numbering corrects it.
+
+| 姓名 | 年龄 | 城市 |
+| :--- | :--: | ---: |
+| 张三 | 25   | 北京 |
+| 李四 | 30   | 上海 |
+| 王五 | 28   | 广州 |
+
+

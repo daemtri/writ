@@ -51,6 +51,7 @@ use crate::inline::{
     detect_github_references_in_line, detect_naked_urls, github_refs_to_styled_regions,
     naked_urls_to_styled_regions,
 };
+use crate::table;
 use crate::line::{Line, LineTheme};
 use crate::paste::{PasteContext, transform_paste};
 
@@ -2116,6 +2117,77 @@ impl Editor {
         (github_matches_by_line, urls_by_line)
     }
 
+    /// Detect pipe tables in a visible line range and return per-line StyledRegions
+    /// that replace the full line with a formatted aligned version.
+    ///
+    /// Rendering rule: if the cursor is inside a table block, we show raw markdown
+    /// for the entire block (no replacements).
+    fn detect_tables(
+        &mut self,
+        start_line: usize,
+        end_line: usize,
+    ) -> HashMap<usize, Vec<StyledRegion>> {
+        let snapshot = self.state.buffer.render_snapshot();
+        let mut result: HashMap<usize, Vec<StyledRegion>> = HashMap::new();
+
+        let start_line = start_line.min(snapshot.line_count());
+        let end_line = end_line.min(snapshot.line_count());
+        if start_line >= end_line {
+            return result;
+        }
+
+        // Collect line text for the range once.
+        let mut lines: Vec<(usize, Range<usize>, String)> = Vec::with_capacity(end_line - start_line);
+        for line_idx in start_line..end_line {
+            let line = snapshot.line_markers(line_idx);
+            let line_range = line.range.clone();
+            let line_text = snapshot
+                .rope
+                .slice(
+                    snapshot.rope.byte_to_char(line_range.start)
+                        ..snapshot.rope.byte_to_char(line_range.end),
+                )
+                .to_string();
+            lines.push((line_idx, line_range, line_text));
+        }
+
+        let cursor_line = self.state.buffer.byte_to_line(self.state.selection.head);
+        let tables = table::detect_pipe_tables(&lines);
+
+        for t in tables {
+            // If cursor is inside this table block, skip replacements for the whole block.
+            if cursor_line >= t.block.start_line && cursor_line < t.block.end_line_exclusive {
+                continue;
+            }
+
+            for (line_idx, full_range, display_text) in t.replacements {
+                // Align with Line's notion of content_range: if the line has prefix markers
+                // (Indent/BlockQuote/List marker spacer area), only replace the content.
+                let line_markers = snapshot.line_markers(line_idx);
+                let content_start = line_markers
+                    .marker_range()
+                    .map(|r| r.end)
+                    .unwrap_or(full_range.start);
+                let full_range = content_start..full_range.end;
+
+                result.entry(line_idx).or_default().push(StyledRegion {
+                    full_range: full_range.clone(),
+                    content_range: full_range,
+                    style: crate::inline::TextStyle {
+                        code: true,
+                        ..crate::inline::TextStyle::default()
+                    },
+                    link_url: None,
+                    is_image: false,
+                    checkbox: None,
+                    display_text: Some(display_text),
+                });
+            }
+        }
+
+        result
+    }
+
     /// Spawn validation tasks for GitHub refs not already in cache.
     fn spawn_github_validation(
         &mut self,
@@ -3987,6 +4059,9 @@ impl Render for Editor {
         self.spawn_github_validation(&github_matches_by_line, cx);
         self.spawn_naked_url_validation(&naked_urls_by_line, cx);
 
+        // Detect tables in visible lines
+        let table_styles_by_line = self.detect_tables(first_visible_line, last_visible_line + 1);
+
         // Store refs for autocomplete and atomic cursor movement
         self.github_refs_by_line = github_matches_by_line.clone();
         self.naked_urls_by_line = naked_urls_by_line.clone();
@@ -4162,6 +4237,7 @@ impl Render for Editor {
         let github_context = self.github_context.clone();
         let hovered_github_ref_range = self.hovered_github_ref_range.clone();
         let input_blocked = self.input_blocked;
+        let table_styles_by_line = table_styles_by_line.clone();
 
         let editor_id = self.instance_id;
         let line_list = div().id(("line-list", editor_id)).size_full().child(
@@ -4262,6 +4338,10 @@ impl Render for Editor {
                             github_ref_ranges.push(url.byte_range.clone());
                         }
                     }
+                }
+
+                if let Some(table_styles) = table_styles_by_line.get(&ix) {
+                    extra_styles.extend(table_styles.clone());
                 }
 
                 let hovered_ref_on_this_line = hovered_github_ref_range.as_ref().and_then(|hr| {

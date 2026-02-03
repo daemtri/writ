@@ -411,9 +411,11 @@ impl Line {
         &self,
         runs: Vec<TextRun>,
         selection_range: Range<usize>,
+        display_text: &str,
     ) -> Vec<TextRun> {
         let selection_color: Hsla = self.theme.selection_color.into();
-        self.apply_background_to_runs(runs, &[selection_range], selection_color)
+        let range = self.clamp_range_to_char_boundaries(selection_range, display_text);
+        self.apply_background_to_runs(runs, &[range], selection_color, display_text)
     }
 
     /// Apply inline highlight to runs.
@@ -448,7 +450,7 @@ impl Line {
             })
             .collect();
 
-        self.apply_background_to_runs(runs, &display_ranges, highlight_color.into())
+        self.apply_background_to_runs(runs, &display_ranges, highlight_color.into(), display_text)
     }
 
     /// Apply background color to runs for the given ranges.
@@ -457,10 +459,23 @@ impl Line {
         runs: Vec<TextRun>,
         ranges: &[Range<usize>],
         bg_color: Hsla,
+        display_text: &str,
     ) -> Vec<TextRun> {
         if ranges.is_empty() {
             return runs;
         }
+
+        // gpui::StyledText::with_runs expects every TextRun.len to slice the underlying
+        // string on UTF-8 character boundaries. Mouse/selection indices can land on
+        // non-boundary byte offsets when we have substitutions (display_text) with
+        // multibyte characters (e.g., CJK in tables). Clamp ranges to char boundaries.
+        let mut ranges: Vec<Range<usize>> = ranges
+            .iter()
+            .map(|r| self.clamp_range_to_char_boundaries(r.clone(), display_text))
+            .filter(|r| r.start < r.end)
+            .collect();
+        ranges.sort_by_key(|r| r.start);
+        ranges.dedup_by(|a, b| a.start == b.start && a.end == b.end);
 
         let mut result = Vec::new();
         let mut pos = 0;
@@ -504,6 +519,24 @@ impl Line {
                         .min()
                         .unwrap_or(current_pos + remaining_len);
 
+                    // Ensure we only split on UTF-8 boundaries.
+                    let mut next_boundary = next_boundary;
+                    while next_boundary > current_pos && !display_text.is_char_boundary(next_boundary)
+                    {
+                        next_boundary -= 1;
+                    }
+                    if next_boundary == current_pos {
+                        // If we couldn't find a boundary inside this segment, fall back to the
+                        // full remaining segment; StyledText will at least fail deterministically
+                        // rather than splitting at an invalid offset.
+                        next_boundary = current_pos + remaining_len;
+                        while next_boundary > current_pos
+                            && !display_text.is_char_boundary(next_boundary)
+                        {
+                            next_boundary -= 1;
+                        }
+                    }
+
                     let segment_len = next_boundary - current_pos;
                     if segment_len > 0 {
                         result.push(TextRun {
@@ -530,6 +563,19 @@ impl Line {
         }
 
         result
+    }
+
+    fn clamp_range_to_char_boundaries(&self, mut range: Range<usize>, text: &str) -> Range<usize> {
+        range.start = range.start.min(text.len());
+        range.end = range.end.min(text.len());
+
+        while range.start > 0 && !text.is_char_boundary(range.start) {
+            range.start -= 1;
+        }
+        while range.end > range.start && !text.is_char_boundary(range.end) {
+            range.end -= 1;
+        }
+        range
     }
 
     fn build_styled_content(&self) -> (String, Vec<TextRun>, Vec<CollapsedDisplayText>) {
@@ -795,17 +841,34 @@ impl Line {
                     buffer_text: buffer_text.to_string(),
                 });
 
-                // Style it as a link
-                runs.push(TextRun {
-                    len: substitution.len(),
-                    font: self.theme.text_font.clone(),
-                    color: self.theme.link_color.into(),
-                    background_color: None,
-                    underline: Some(gpui::UnderlineStyle {
+                // Only style as a link when the region actually has a URL.
+                // (Tables and other substitutions use display_text without link_url.)
+                let is_link = region.link_url.is_some();
+                let font = if region.style.code {
+                    self.theme.code_font.clone()
+                } else {
+                    self.theme.text_font.clone()
+                };
+                let color: Hsla = if is_link {
+                    self.theme.link_color.into()
+                } else {
+                    self.theme.text_color.into()
+                };
+                let underline = if is_link {
+                    Some(gpui::UnderlineStyle {
                         thickness: px(1.0),
                         color: Some(self.theme.link_color.into()),
                         wavy: false,
-                    }),
+                    })
+                } else {
+                    None
+                };
+                runs.push(TextRun {
+                    len: substitution.len(),
+                    font,
+                    color,
+                    background_color: None,
+                    underline,
                     strikethrough: None,
                 });
                 continue;
@@ -1293,7 +1356,7 @@ impl RenderOnce for Line {
         let visual_selection = self.compute_visual_selection_range(&display_text);
 
         let mut runs = if let Some(ref sel_range) = visual_selection {
-            self.apply_selection_to_runs(runs, sel_range.clone())
+            self.apply_selection_to_runs(runs, sel_range.clone(), &display_text)
         } else {
             runs
         };
