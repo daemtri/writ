@@ -2160,6 +2160,8 @@ impl Editor {
                 continue;
             }
 
+            let header_line = t.block.start_line;
+
             for (line_idx, full_range, display_text) in t.replacements {
                 // Align with Line's notion of content_range: if the line has prefix markers
                 // (Indent/BlockQuote/List marker spacer area), only replace the content.
@@ -2170,11 +2172,14 @@ impl Editor {
                     .unwrap_or(full_range.start);
                 let full_range = content_start..full_range.end;
 
+                let is_header = line_idx == header_line;
+
                 result.entry(line_idx).or_default().push(StyledRegion {
                     full_range: full_range.clone(),
                     content_range: full_range,
                     style: crate::inline::TextStyle {
                         code: true,
+                        bold: is_header,
                         ..crate::inline::TextStyle::default()
                     },
                     link_url: None,

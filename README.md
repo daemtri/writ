@@ -219,8 +219,8 @@ Pressing Shift+Enter on an ordered list item inserts `1. ` as a placeholder. The
 
 | 姓名 | 年龄 | 城市 |
 | :--- | :--: | ---: |
-| 张三 | 25   | 北京 |
-| 李四 | 30   | 上海 |
-| 王五 | 28   | 广州 |
+| 张三 | 25| 北京 |
+| 李四 | 30| 上海 |
+| 王五 | 28| 广州 |
 
 

@@ -844,10 +844,24 @@ impl Line {
                 // Only style as a link when the region actually has a URL.
                 // (Tables and other substitutions use display_text without link_url.)
                 let is_link = region.link_url.is_some();
-                let font = if region.style.code {
-                    self.theme.code_font.clone()
+                let base_font = if region.style.code {
+                    base_code_font
                 } else {
-                    self.theme.text_font.clone()
+                    base_text_font
+                };
+
+                let font = Font {
+                    weight: if region.style.bold {
+                        FontWeight::BOLD
+                    } else {
+                        base_font.weight
+                    },
+                    style: if region.style.italic {
+                        FontStyle::Italic
+                    } else {
+                        base_font.style
+                    },
+                    ..base_font.clone()
                 };
                 let color: Hsla = if is_link {
                     self.theme.link_color.into()
