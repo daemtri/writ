@@ -20,9 +20,8 @@ static NEXT_EDITOR_ID: AtomicUsize = AtomicUsize::new(0);
 use gpui::{
     AnyElement, App, Bounds, Context, Corner, CursorStyle, DragMoveEvent, ElementInputHandler,
     Empty, EntityInputHandler, FocusHandle, Focusable, Hsla, IntoElement, KeyDownEvent,
-    ListAlignment, ListState, ModifiersChangedEvent, MouseButton, Pixels, ReadGlobal, Render,
-    Rgba, TextRun, UTF16Selection, Window, anchored, canvas, div, font, list, point, prelude::*,
-    px,
+    ListAlignment, ListState, ModifiersChangedEvent, MouseButton, Pixels, ReadGlobal, Render, Rgba,
+    TextRun, UTF16Selection, Window, anchored, canvas, div, font, list, point, prelude::*, px,
 };
 
 /// Marker type for text selection drag operations.
@@ -1832,7 +1831,11 @@ impl Editor {
                             }
 
                             // During IME composition, keep caret solid/visible.
-                            if editor.marked_range_utf16.is_some() {
+                            if editor
+                                .marked_range_utf16
+                                .as_ref()
+                                .is_some_and(|r| r.start < r.end)
+                            {
                                 editor.cursor_visible = true;
                                 cx.notify();
                                 return true;
@@ -3788,8 +3791,14 @@ impl EntityInputHandler for Editor {
         })
     }
 
-    fn marked_text_range(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Range<usize>> {
-        self.marked_range_utf16.clone()
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        // Some IMEs may leave an empty marked range (start==end) while still composing.
+        // Treat empty as unmarked so input routing (e.g. Backspace) behaves normally.
+        self.marked_range_utf16.clone().filter(|r| r.start < r.end)
     }
 
     fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -3863,21 +3872,23 @@ impl EntityInputHandler for Editor {
         self.insert_text(new_text);
         let insert_end = insert_start + new_text.len();
 
-        self.marked_range_utf16 = Some(self.utf16_range_for_byte_range(insert_start..insert_end));
+        let marked_range_utf16 = self.utf16_range_for_byte_range(insert_start..insert_end);
+        self.marked_range_utf16 = if marked_range_utf16.start < marked_range_utf16.end {
+            Some(marked_range_utf16.clone())
+        } else {
+            None
+        };
 
         if let Some(new_selected_range_utf16) = new_selected_range_utf16 {
             // GPUI/IME APIs report the selected range within the newly inserted marked text
             // (i.e., relative to `new_text`), not absolute document offsets.
             // Some platforms may report absolute offsets, so detect and handle both.
-            let marked_range_utf16 = self.marked_range_utf16.clone();
-            let absolute_selected_range_utf16 = if let Some(marked_range_utf16) = marked_range_utf16 {
-                let marked_len = marked_range_utf16.end.saturating_sub(marked_range_utf16.start);
-                if new_selected_range_utf16.end <= marked_len {
-                    (marked_range_utf16.start + new_selected_range_utf16.start)
-                        ..(marked_range_utf16.start + new_selected_range_utf16.end)
-                } else {
-                    new_selected_range_utf16
-                }
+            let marked_len = marked_range_utf16
+                .end
+                .saturating_sub(marked_range_utf16.start);
+            let absolute_selected_range_utf16 = if new_selected_range_utf16.end <= marked_len {
+                (marked_range_utf16.start + new_selected_range_utf16.start)
+                    ..(marked_range_utf16.start + new_selected_range_utf16.end)
             } else {
                 new_selected_range_utf16
             };
@@ -4173,9 +4184,9 @@ impl Render for Editor {
                                   github_ref_ranges: Vec<Range<usize>>,
                                   hovered_ref_range: Option<Range<usize>>,
                                   line_background: Option<Rgba>,
-                                   inline_highlight_ranges: Vec<Range<usize>>,
-                                   inline_highlight_color: Option<Rgba>,
-                                   block_input: bool|
+                                  inline_highlight_ranges: Vec<Range<usize>>,
+                                  inline_highlight_color: Option<Rgba>,
+                                  block_input: bool|
                  -> Line {
                     let line_markers = snap.line_markers(line_idx);
                     let mut inline_styles = snap.inline_styles_for_line(line_idx);
